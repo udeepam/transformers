@@ -44,6 +44,7 @@ from ...utils import (
 )
 from .configuration_whisper import WhisperConfig
 from .generation_whisper import WhisperGenerationMixin
+from .tokenization_whisper import WhisperTokenizer
 
 
 if is_flash_attn_2_available():
@@ -1667,6 +1668,9 @@ class WhisperForConditionalGeneration(WhisperGenerationMixin, WhisperPreTrainedM
         super().__init__(config)
         self.model = WhisperModel(config)
         self.proj_out = nn.Linear(config.d_model, config.vocab_size, bias=False)
+
+        # HACK:
+        self.whisper_tokenizer = WhisperTokenizer.from_pretrained(pretrained_model_name_or_path=self.config._name_or_path)
 
         # Initialize weights and apply final processing
         self.post_init()

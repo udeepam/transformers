@@ -1352,6 +1352,9 @@ class GenerationMixin:
         model_kwargs = generation_config.update(**kwargs)  # All unused kwargs must be model kwargs
         self._validate_model_kwargs(model_kwargs.copy())
 
+        # HACK:
+        # print(generation_config.temperature, generation_config.do_sample, generation_config.num_beams)
+
         # 2. Set generation parameters if not already defined
         logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
         stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
@@ -1472,6 +1475,8 @@ class GenerationMixin:
 
         # 7. determine generation mode
         generation_mode = self._get_generation_mode(generation_config, assistant_model)
+        # HACK:
+        # print(generation_mode)
 
         if streamer is not None and (generation_config.num_beams > 1):
             raise ValueError(

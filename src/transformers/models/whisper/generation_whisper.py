@@ -18,6 +18,7 @@ import warnings
 import zlib
 from typing import Callable, Iterator, List, Optional, Tuple, Union
 
+from jiwer import wer
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -486,6 +487,8 @@ class WhisperGenerationMixin:
             input_features=input_features, input_stride=input_stride, kwargs=kwargs
         )
         is_shortform = total_input_frames <= num_segment_frames
+        # HACK:
+        is_shortform = False
 
         if is_shortform:
             # warn user of ignored inputs
@@ -622,6 +625,10 @@ class WhisperGenerationMixin:
             generation_config=generation_config,
         )
 
+        # current_segments: batch_size, num_segments
+        # If using prompt first segment: {"tokens": sequence}
+        # Otherwise: {"start":, "end":, "tokens":, "result":}
+
         batch_idx_map = list(range(batch_size))
         do_condition_on_prev_tokens = [condition_on_prev_tokens for _ in range(batch_size)]
 
@@ -640,6 +647,8 @@ class WhisperGenerationMixin:
             )
             time_offset = seek * time_precision / input_stride
             seek_num_frames = (max_frames - seek).clamp(max=num_segment_frames)
+            # HACK:
+            # print(seek.item(), seek_num_frames.item(), max_frames.item())
 
             # 6.4 cut out next 30s segment from input features
             segment_input = self._get_input_segment(
@@ -699,8 +708,12 @@ class WhisperGenerationMixin:
                 synced_gpus=synced_gpus,
                 return_token_timestamps=return_token_timestamps,
                 do_condition_on_prev_tokens=do_condition_on_prev_tokens,
-                kwargs=kwargs,
+                # HACK:
+                kwargs=dict(kwargs),
             )
+            for i, seek_output in enumerate(seek_outputs):
+                seek_output["seek"] = seek[i].item()
+                seek_output["seek_num_frames"] = seek_num_frames[i].item()
 
             # 6.9 In every generated sequence, split by timestamp tokens and extract segments
             for i, seek_sequence in enumerate(seek_sequences):
@@ -724,7 +737,12 @@ class WhisperGenerationMixin:
                 )
 
                 current_segments[prev_i] += segments
-                seek[prev_i] += segment_offset
+                # HACK:
+                if seek[prev_i] + segment_input.shape[-1] >= max_frames[prev_i]:
+                    seek[prev_i] = max_frames[prev_i]
+                else:
+                    # HACK:
+                    seek[prev_i] += segment_offset
 
         # 7. Once all segments are added to the list of all segments, called `current_segments`, we extract the predicted
         # output tokens from the list of dicts. If we use batch size > 1, we make sure to pad the output
@@ -733,7 +751,11 @@ class WhisperGenerationMixin:
             if (prompt_ids is not None and generation_config.prompt_condition_type == "first-segment")
             else current_segments
         )
-        sequences = _pad_to_max_length(final_segments, generation_config.pad_token_id, padding="right")
+        if (len(final_segments) == 1) and (len(final_segments[0]) == 0):
+            # Empty as skipped.
+            sequences = torch.tensor(final_segments)
+        else:
+            sequences = _pad_to_max_length(final_segments, generation_config.pad_token_id, padding="right")
 
         # 8. If we return all segments, the predicted output sequences are put under `"sequences"`.
         if return_segments:
@@ -774,7 +796,8 @@ class WhisperGenerationMixin:
             generation_config.do_sample = temperature is not None and temperature > 0.0
 
             generation_config.temperature = temperature if generation_config.do_sample else 1.0
-            generation_config.num_beams = kwargs.pop("num_beams", 1) if not generation_config.do_sample else 1
+            # HACK:
+            generation_config.num_beams = kwargs.get("num_beams", 1) if not generation_config.do_sample else 1
 
             seek_outputs = super().generate(
                 segment_input,
@@ -786,14 +809,59 @@ class WhisperGenerationMixin:
                 decoder_input_ids=decoder_input_ids,
                 **kwargs,
             )
+            # sequences:        (batch_size*num_return_sequences, sequence_length + num_decoder_input_ids)
+            # scores:           sequence_length, (batch_size*num_return_sequences or num_beams, vocab_size)
+            # beam_indices:     (batch_size*num_return_sequences, sequence_length)
+            # sequences_scores: (batch_size*num_return_sequences)
+            # cross_attentions: sequence_length, num_layers, (batch_size, num_heads, prev_sequence_length, audio_length)
+            # prev_sequence_length = context for first sequence and 1 for proceeding for efficiency.
 
-            # post-process sequence tokens and outputs to be in list form
-            seek_sequences, seek_outputs = self._postprocess_outputs(
+            # post-process sequence tokens and outputs
+            seek_outputs = self._postprocess_outputs(
                 seek_outputs=seek_outputs,
                 decoder_input_ids=decoder_input_ids,
                 return_token_timestamps=return_token_timestamps,
                 generation_config=generation_config,
             )
+            # sequences:        (batch_size*num_return_sequences, sequence_length)
+            # scores:           sequence_length, (batch_size*num_return_sequences or num_beams, vocab_size)
+            # beam_indices:     (batch_size*num_return_sequences, sequence_length)
+            # sequences_scores: (batch_size*num_return_sequences)
+
+            # HACK: select the best sequence from each batch
+            if (generation_config.num_return_sequences > 1) or (kwargs.get("num_return_sequences") is not None and kwargs.get("num_return_sequences") > 1):
+                seek_sequences, seek_outputs = self._select_best_sequence(
+                    input_features=segment_input,
+                    seek_outputs=seek_outputs,
+                    batch_size=cur_bsz
+                )
+            else:
+                seek_sequences = seek_outputs["sequences"]
+                seek_outputs["best_idx"] = torch.zeros(cur_bsz)
+            # seek_sequences:   (batch_size, sequence_length)
+            # sequences:        (batch_size*num_return_sequences, sequence_length)
+            # scores:           sequence_length, (batch_size*num_return_sequences or num_beams, vocab_size)
+            # beam_indices:     (batch_size*num_return_sequences, sequence_length)
+            # sequences_scores: (batch_size*num_return_sequences)
+
+            # split into batches
+            seek_outputs = self._split_by_batch_index(seek_outputs=seek_outputs, cur_bsz=cur_bsz)
+            for seek_output in seek_outputs:
+                seek_output["fallback_idx"] = fallback_idx
+            # seek_sequences:   (batch_size, sequence_length)
+            # sequences:        (num_return_sequences, sequence_length)
+            # scores:           sequence_length, (num_return_sequences or num_beams, vocab_size)
+            # beam_indices:     (num_return_sequences, sequence_length)
+            # sequences_scores: (num_return_sequences)
+
+            # HACK:
+            # for i, sequence in enumerate(seek_outputs[0]["sequences"]):
+            #     print(f"Sequences {i+1}")
+            #     if i == seek_outputs[0]["best_idx"]:
+            #         print("SELECTED")
+            #     print(self.whisper_tokenizer.decode(token_ids=sequence, decode_with_timestamps=True))
+            #     print()
+
 
             # 6.7 Extract cut sequences from every sequence and check if fallback should be applied
             # Loop over each decoded audio individually as each decoding can be of a different length
@@ -887,23 +955,32 @@ class WhisperGenerationMixin:
 
         seek_outputs["sequences"] = seek_outputs["sequences"][:, decoder_input_ids.shape[-1] :]
 
-        def split_by_batch_index(values, key, batch_idx):
+        return seek_outputs
+
+    def _split_by_batch_index(self, seek_outputs, cur_bsz):
+        def split_by_batch_index(values, key, batch_idx, batch_size):
+            # HACK:
             if key == "scores":
-                return [v[batch_idx].cpu() for v in values]
-            elif key == "past_key_values":
+                # num_return_sequences = num_beams for beam methods
+                num_return_sequences = values[0].shape[0] // batch_size
+                start_index = num_return_sequences * batch_idx
+                end_index = num_return_sequences * (batch_idx + 1)
+                return [v[start_index:end_index].cpu() for v in values]
+            if key == "past_key_values":
                 # we don't save `past_key_values` as this is too costly
                 return None
-            elif isinstance(values[batch_idx], tuple) and torch.is_tensor(values[batch_idx][0]):
-                return tuple(tuple(w[batch_idx][None].cpu() for w in v) for v in values)
-            return values[batch_idx].cpu()
 
-        sequence_tokens = seek_outputs["sequences"]
+            num_return_sequences = values.shape[0] // batch_size
+            start_index = num_return_sequences * batch_idx
+            end_index = num_return_sequences * (batch_idx + 1)
+            return values[start_index:end_index].cpu()
+
         seek_outputs = [
-            {k: split_by_batch_index(v, k, i) for k, v in seek_outputs.items()}
-            for i in range(sequence_tokens.shape[0])
+            {k: split_by_batch_index(v, k, i, cur_bsz) for k, v in seek_outputs.items()}
+            # HACK:
+            for i in range(cur_bsz)
         ]
-
-        return sequence_tokens, seek_outputs
+        return seek_outputs
 
     def _need_fallback(
         self,
@@ -925,9 +1002,13 @@ class WhisperGenerationMixin:
 
         if generation_config.logprob_threshold is not None:
             if "sequences_scores" in seek_outputs[0]:
+                # HACK:
                 logprobs = [s["sequences_scores"] for s in seek_outputs][index]
+                if logprobs.shape[0] > 1:
+                    logprobs = logprobs[seek_outputs[index]["best_idx"]]
             else:
-                scores = seek_outputs[index]["scores"]
+                # HACK:
+                scores = [s[seek_outputs[index]["best_idx"]] for s in seek_outputs[index]["scores"]]
                 logprobs = self._retrieve_avg_logprobs(
                     scores, seek_sequence, generation_config.eos_token_id, temperature
                 )
@@ -946,6 +1027,10 @@ class WhisperGenerationMixin:
             ):
                 needs_fallback = False
                 should_skip = True
+
+        # HACK:
+        if seek_outputs[index].get("needs_fallback") is not None and seek_outputs[index]["needs_fallback"]:
+            needs_fallback = True
 
         return needs_fallback, should_skip
 
@@ -1592,7 +1677,8 @@ class WhisperGenerationMixin:
     @staticmethod
     def _retrieve_avg_logprobs(scores, tokens, eos_token_id, temperature):
         rescale_temperature = temperature if temperature > 0.0 else 1
-        scores = torch.stack(scores).to(tokens.device)
+        # HACK:
+        scores = torch.stack(scores).squeeze(dim=1).to(tokens.device)
 
         if scores.shape[0] > tokens.shape[0]:
             scores = scores[: tokens.shape[0]]
@@ -1688,3 +1774,165 @@ class WhisperGenerationMixin:
             segment_offset = seek_num_frames[prev_idx]
 
         return segments, segment_offset
+
+    # HACK:
+    def _select_best_sequence(self, input_features, seek_outputs, batch_size):
+        # (batch_size*num_return_sequences, sequence_length)
+        seek_sequences = seek_outputs["sequences"]
+        num_return_sequences = seek_sequences.shape[0] // batch_size
+
+        # decoded_sequences = self.whisper_tokenizer.batch_decode(sequences=seek_sequences, skip_special_tokens=True)
+        # cleaned_decoded_sequences = [clean_text(s) for s in decoded_sequences]
+        # # Step 1: eliminate sequences with hallucinations
+        # # (batch_size, num_return_sequences)
+        # sequences_to_ignore = torch.zeros(batch_size, num_return_sequences, dtype=torch.bool)
+        # if task.startswith("cat_"):
+        #     # (batch_size*num_return_sequences, num_n_grams)
+        #     consecutive_substring_count = torch.tensor([count_consecutive_substrings(s) for s in cleaned_decoded_sequences])
+        #     # get sequences to ignore
+        #     sequences_to_ignore = (consecutive_substring_count >= torch.tensor([3, 3, 2, 2])).any(dim=1).view(batch_size, num_return_sequences)
+        # # Step 2: select the best sequence
+        # # (batch_size)
+        # selected_indices = select_longest_sequence(decoded_sequences, sequences_to_ignore, batch_size, num_return_sequences)
+
+        # Cosine similarity.
+        # with torch.no_grad():
+        #     # (batch_size*num_return_sequences, sequence_length, hidden_size)
+        #     last_hidden_state = self.model(
+        #         input_features=input_features,
+        #         decoder_input_ids=seek_sequences,
+        #         return_dict=True,
+        #         output_hidden_states=True,
+        #     )["last_hidden_state"]
+        #     # Average (batch_size, num_return_sequences, hidden_size).
+        #     average_last_hidden_state = last_hidden_state.mean(dim=1).view(batch_size, num_return_sequences, -1)
+        #     # Compute the cosine similarity matrix, (batch_size, num_return_sequences, num_return_sequences).
+        #     cosine_similarity = compute_cosine_similarity(average_last_hidden_state)
+        #     # Compute the total similarity score for each sequence, (batch_size, num_return_sequences).
+        #     total_similarity_scores = cosine_similarity.sum(dim=-1)
+        #     # Identify the sequence with the highest total similarity score, (batch_size).
+        #     most_central_sequence_idx = torch.argmax(total_similarity_scores, dim=-1)
+        #     # Retrieve the similarity scores of the most central sequence, (batch_size, num_return_sequences).
+        #     similarities_to_central_sequence = cosine_similarity[torch.arange(batch_size), most_central_sequence_idx]
+        #     # Drop sequences below a threshold, (batch_size, num_return_sequences).
+        #     sequences_to_ignore = (similarities_to_central_sequence < 0.2)
+
+        #     # Average including only first instance of EOS token ID, (batch_size, num_return_sequences, hidden_size).
+        #     average_last_hidden_state_eos_token = average_masking_eos_token(
+        #         last_hidden_state=last_hidden_state,
+        #         input_ids=seek_sequences,
+        #         eos_token_id=self.config.eos_token_id
+        #     ).view(batch_size, num_return_sequences, -1)
+        #     masked_average_last_hidden_state_eos_token = average_last_hidden_state_eos_token * (~sequences_to_ignore).float().unsqueeze(-1)
+        #     # Compute the cosine similarity matrix, (batch_size, num_return_sequences, num_return_sequences).
+        #     masked_cosine_similarity = compute_cosine_similarity(masked_average_last_hidden_state_eos_token)
+        #     # Compute the total similarity score for each sequence, (batch_size, num_return_sequences).
+        #     masked_total_similarity_scores = masked_cosine_similarity.sum(dim=-1)
+        #     # Identify the sequence with the highest total similarity score, (batch_size).
+        #     selected_indices = torch.argmax(masked_total_similarity_scores, dim=-1)
+        # with torch.no_grad():
+        #     # (batch_size*num_return_sequences, sequence_length, hidden_size)
+        #     last_hidden_state = self.model(
+        #         input_features=input_features,
+        #         decoder_input_ids=seek_sequences,
+        #         return_dict=True,
+        #         output_hidden_states=True,
+        #     )["last_hidden_state"]
+        #     # Average, (batch_size, num_return_sequences, hidden_size).
+        #     average_last_hidden_state = last_hidden_state.mean(dim=1).view(batch_size, num_return_sequences, -1)
+        #     # Compute the cosine similarity matrix, (batch_size, num_return_sequences, num_return_sequences).
+        #     cosine_similarity = compute_cosine_similarity(average_last_hidden_state)
+        #     # Compute the total similarity score for each sequence, (batch_size, num_return_sequences).
+        #     total_similarity_scores = cosine_similarity.sum(dim=-1)
+        #     # Identify the sequence with the highest total similarity score, (batch_size).
+        #     selected_indices = torch.argmax(total_similarity_scores, dim=-1)
+
+        # WER.
+        # (batch_size*num_return_sequences).
+        decoded_sequences = self.whisper_tokenizer.batch_decode(sequences=seek_sequences, skip_special_tokens=True)
+        # (batch_size, num_return_sequences).
+        cleaned_decoded_sequences = np.array([clean_text(s) for s in decoded_sequences]).reshape(batch_size, num_return_sequences)
+        # Compute WER, (batch_size, num_return_sequences, num_return_sequences).
+        wer_matrix = compute_wer(cleaned_decoded_sequences)
+        # Compute the total WER for each sequence, (batch_size, num_return_sequences).
+        total_wer = wer_matrix.transpose(-1, -2).sum(dim=-1)
+        # total_wer = wer_matrix.sum(dim=-1)
+        # Identify the sequence with the lowest total WER, (batch_size).
+        selected_indices = torch.argmin(total_wer, dim=-1)
+
+        # is_eos_token = (seek_sequences == self.config.eos_token_id)
+        # cumulative_eos_token = is_eos_token.cumsum(dim=1)
+        # mask_first_eos_token = (cumulative_eos_token == 1) | ~is_eos_token
+        # tmp_sequences = [s[mask] for s, mask in zip(seek_sequences, mask_first_eos_token)]
+        # tmp_decoded_sequences = self.whisper_tokenizer.batch_decode(sequences=tmp_sequences, decode_with_timestamps=True)
+        # tmp_decoded_sequences = self.whisper_tokenizer.batch_decode(sequences=seek_sequences, skip_special_tokens=True)
+        # tmp_decoded_sequences = [clean_text(s) for s in tmp_decoded_sequences]
+        # print(tmp_decoded_sequences[selected_indices.item()])
+        # for sequence, score in zip(tmp_decoded_sequences, total_wer[0].tolist()):
+        #     print("SCORE:", score)
+        #     print(sequence)
+        # print()
+
+        # Since the original sequences tensor is flat, we need to adjust the indices to select correctly
+        sequences_to_keep = seek_sequences.view(batch_size, num_return_sequences, -1)[torch.arange(batch_size), selected_indices]
+        # Save in outputs.
+        seek_outputs["best_idx"] = selected_indices
+        # seek_outputs["needs_fallback"] = sequences_to_ignore.all(dim=-1)
+
+        return sequences_to_keep, seek_outputs
+
+def clean_text(text):
+    # Lower case and remove punctuation.
+    text = text.lower().translate(str.maketrans("", "", ".!?;:,…"))
+    # Remove stutters.
+    text = " ".join([w[:-1] if w.endswith("-") else w for w in text.split()])
+    # Convert empty strings to "[silence]".
+    if ((len(text) == 0) or (text.isspace())):
+        text = "[silence]"
+    return text.strip()
+
+
+def compute_wer(sequences):
+    batch_size, num_sequences = sequences.shape
+
+    wer_matrix = np.zeros((batch_size, num_sequences, num_sequences))
+    for i in range(batch_size):
+        for j in range(num_sequences):
+            for k in range(num_sequences):
+                if j != k:
+                    wer_matrix[i, j, k] = wer(reference=sequences[i, j], hypothesis=sequences[i, k])
+                else:
+                    wer_matrix[i, j, k] = 0.0
+
+    wer_matrix = torch.from_numpy(wer_matrix)
+
+    return wer_matrix
+
+
+def average_masking_eos_token(last_hidden_state, input_ids, eos_token_id):
+    # Step 1: Identify and mask all EOS token IDs, except for the first instance, (batch_size, sequence_length).
+    is_eos_token = (input_ids == eos_token_id)
+    cumulative_eos_token = is_eos_token.cumsum(dim=1)
+    mask_first_eos_token = (cumulative_eos_token == 1) | ~is_eos_token
+
+    # Step 2: Expand the mask to match the dimensions of last_hidden_state, (batch_size, sequence_length, hidden_size).
+    expanded_mask = mask_first_eos_token.unsqueeze(-1).expand_as(last_hidden_state)
+
+    # Step 3: Compute the weighted average
+    # Use the expanded mask to compute the sum of the relevant hidden states, (batch_size, hidden_size).
+    sum_hidden_state = (last_hidden_state * expanded_mask.float()).sum(dim=1)
+
+    # Count the tokens included in the average for each sequence (avoid division by zero)
+    token_counts = expanded_mask.float().sum(dim=1).clamp(min=1)
+
+    # Calculate the average
+    average_hidden_state = sum_hidden_state / token_counts
+
+    return average_hidden_state
+
+def compute_cosine_similarity(inputs):
+    # Normalize each vector to have unit norm, (batch_size, num_sequences, hidden_size).
+    normed = F.normalize(inputs, p=2, dim=-1)
+    # Compute the cosine similarity matrix, (batch_size, num_sequences, num_sequences).
+    cosine_similarity_matrix = normed@normed.transpose(-1, -2)
+    return cosine_similarity_matrix
